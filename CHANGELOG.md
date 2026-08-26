@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- [OpenApi] [GH#324](https://github.com/janephp/janephp/issues/324) New `Jane\Component\OpenApiRuntime\Client\Pagination\Paginator` runtime helper to lazily iterate over every item of a paginated endpoint from any generated client, with built-in page-number, offset/limit and cursor strategies (and a generic `fromCallable()` building block for custom ones)
 - [JsonSchema] New `<Namespace>\Runtime\JsonObject` runtime class shipped with every generated library, used to represent objects & maps in normalized payloads
 - [Docs] New [Architecture Decision Records](docs/contributing/adrs/index.md) documenting key generator/runtime decisions
 - [JsonSchema] [GH#865](https://github.com/janephp/janephp/issues/865) New `enums-as-objects` option to generate native PHP backed enums for schemas with an `enum` keyword (`string` / `integer` types)

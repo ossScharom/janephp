@@ -10,6 +10,7 @@
     - [Between two Symfony apps](guides/two_symfony_apps.md)
     - [Validation](guides/validation.md)
     - [Nullability](guides/nullable.md)
+    - [Pagination](guides/pagination.md)
     - [External API Client](guides/external_client.md)
     - [Elasticsearch models](guides/elasticsearch.md)
 - [Contributing](contributing/index.md)

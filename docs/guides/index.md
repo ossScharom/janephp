@@ -21,6 +21,9 @@ This section gathers advanced use-cases, integrations with other tools (like Sym
 * **[Handling Nullable Values](nullable.md)**
   Understand the important distinction Jane makes between a **missing** value (key missing in JSON) and a **null** value, and how to handle these cases in your PHP code.
 
+* **[Paginated endpoints](pagination.md)**
+  Iterate lazily over every item of a paginated endpoint with the runtime `Paginator` helper, whatever pagination style your API uses (page number, offset/limit or cursor).
+
 ## Client & HTTP Configuration
 
 * **[Using a Custom HTTP Client](external_client.md)**
