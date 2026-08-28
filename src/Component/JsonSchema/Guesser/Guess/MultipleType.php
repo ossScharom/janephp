@@ -89,10 +89,10 @@ class MultipleType extends Type
     public function getDocTypeHint(string $namespace): string|Name|null
     {
         $stringTypes = array_map(function ($type) use ($namespace) {
-            return $type->getDocTypeHint($namespace);
+            return (string) $type->getDocTypeHint($namespace);
         }, $this->types);
 
-        return implode('|', $stringTypes);
+        return implode('|', array_unique($stringTypes));
     }
 
     public function getTypeHint(string $namespace): Identifier|Name|null
