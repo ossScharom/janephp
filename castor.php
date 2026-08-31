@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Castor\Attribute\AsTask;
+use Symfony\Component\Process\Process;
 
 use function Castor\context;
 use function Castor\http_download;
@@ -10,6 +11,7 @@ use function Castor\io;
 use function Castor\PHPQa\php_cs_fixer;
 use function Castor\PHPQa\phpstan;
 use function Castor\run;
+use function Castor\with;
 
 #[AsTask('cs:check', namespace: 'qa', description: 'Check for coding standards without fixing them')]
 function qa_cs_check(): void
@@ -36,6 +38,89 @@ function qa_phpstan(bool $generateBaseline = false): void
     }
 
     phpstan($params, '2.2.2');
+}
+
+#[AsTask('phpstan:generated', namespace: 'qa', description: 'Run PHPStan over the code Jane generates (fixture expected/ trees)')]
+function qa_phpstan_generated(bool $generateBaseline = false): void
+{
+    require_once __DIR__ . '/tools/phpstan-generated.php';
+
+    $groups = Jane\Tools\PhpstanGenerated\groups();
+    $baselineParts = sys_get_temp_dir() . '/jane-phpstan-generated-baseline';
+    $baselineFile = __DIR__ . '/phpstan-generated-baseline.neon';
+    $previousBaseline = null;
+
+    if ($generateBaseline) {
+        // The config includes the baseline, so it has to be emptied before
+        // regenerating it: otherwise every already-known error stays ignored
+        // and the new baseline comes out empty. Keep the old content around to
+        // restore it if generation fails.
+        $previousBaseline = file_get_contents($baselineFile);
+        file_put_contents($baselineFile, "parameters:\n\tignoreErrors: []\n");
+
+        run('rm -rf ' . escapeshellarg($baselineParts), context: context()->withAllowFailure());
+        @mkdir($baselineParts, 0777, true);
+    }
+
+    io()->title(sprintf('PHPStan on generated code — %d group(s)', \count($groups)));
+
+    $failed = [];
+    $parts = [];
+
+    foreach ($groups as $position => $directories) {
+        $params = ['analyse', '--configuration', __DIR__ . '/phpstan-generated.neon', '--memory-limit=4G', '--no-progress'];
+
+        if ($generateBaseline) {
+            $params[] = '--generate-baseline';
+            $params[] = $parts[] = sprintf('%s/%03d.neon', $baselineParts, $position);
+        }
+
+        foreach ($directories as $directory) {
+            $params[] = __DIR__ . '/' . $directory;
+        }
+
+        io()->section(sprintf('[%d/%d] %s', $position + 1, \count($groups), implode(', ', $directories)));
+
+        $process = with(
+            callback: static fn (): Process => phpstan($params, '2.2.2'),
+            allowFailure: true,
+        );
+
+        if (!$process->isSuccessful()) {
+            $failed[] = $directories;
+        }
+    }
+
+    if ($generateBaseline) {
+        // A failed group has written no (or a truncated) part: merging the
+        // rest would silently drop its entries from the committed baseline.
+        if ([] !== $failed) {
+            file_put_contents($baselineFile, $previousBaseline);
+
+            throw new RuntimeException(sprintf(
+                "Baseline generation failed for %d group(s), restored the previous baseline:\n  %s",
+                \count($failed),
+                implode("\n  ", array_map(static fn (array $directories): string => implode(', ', $directories), $failed))
+            ));
+        }
+
+        Jane\Tools\PhpstanGenerated\mergeBaselines($parts, $baselineFile);
+        run('rm -rf ' . escapeshellarg($baselineParts), context: context()->withAllowFailure());
+
+        io()->success('Baseline regenerated.');
+
+        return;
+    }
+
+    if ([] !== $failed) {
+        throw new RuntimeException(sprintf(
+            "PHPStan reported new errors in %d group(s):\n  %s",
+            \count($failed),
+            implode("\n  ", array_map(static fn (array $directories): string => implode(', ', $directories), $failed))
+        ));
+    }
+
+    io()->success('No new errors in generated code.');
 }
 
 #[AsTask('install', namespace: 'doc', description: 'Install tool for documentation (need poetry)')]

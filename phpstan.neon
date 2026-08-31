@@ -3,6 +3,9 @@ parameters:
 	tmpDir: cache
 	paths:
 		- src/
+	scanFiles:
+		# Required at runtime by ExpectedNamespaceUniquenessTest; not autoloaded.
+		- tools/phpstan-generated.php
 	excludePaths:
 		analyse:
 			- src/Component/*/JsonSchema/*

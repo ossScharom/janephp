@@ -1,0 +1,27 @@
+# Static analysis of *generated* code (see docs/contributing/tests.md).
+#
+# The main phpstan.neon deliberately excludes fixture trees: this config is the
+# counterpart that analyses the code Jane produces, which is what the project
+# actually ships to its users. It covers every committed `expected/` tree —
+# 179 fixtures, ~20 000 files.
+#
+# It deliberately declares no `paths`. One PHPStan process cannot hold all the
+# trees (it is OOM-killed above roughly 4 000 files), so
+# tools/phpstan-generated.php packs the fixtures into file-count-capped groups
+# and `castor qa:phpstan:generated` passes each group's paths on the CLI.
+#
+# Target level is 5: the highest level where every reported error is a defect
+# rather than a documentation-style preference. Level 6 adds ~9 200 findings on
+# a real-world client, all `missingType.*`, and is deliberately out of scope.
+includes:
+    - phpstan-generated-baseline.neon
+parameters:
+    level: 5
+    tmpDir: cache
+    # The baseline is committed, so the analysis has to be reproducible: without
+    # this, findings depend on whichever PHP the contributor happens to run and
+    # the baseline stops matching. Pinned to the version the CI job installs.
+    phpVersion: 80400
+    # Each group only ever sees its own share of the baseline, and the entries
+    # are path-scoped, so every run legitimately leaves most of them unmatched.
+    reportUnmatchedIgnoredErrors: false
