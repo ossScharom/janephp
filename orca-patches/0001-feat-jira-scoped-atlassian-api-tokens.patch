@@ -1,0 +1,1306 @@
+From f372c1b2fa41b08ca1cf1d69efa9d158bbd92b5b Mon Sep 17 00:00:00 2001
+From: Jerome Wuerf <oss@scharom.de>
+Date: Fri, 11 Sep 2026 06:29:25 +0000
+Subject: [PATCH] feat(jira): support scoped Atlassian API tokens via the
+ api.atlassian.com gateway
+
+Scoped Atlassian API tokens are rejected on the site host, so a Cloud site
+could only be connected with an unscoped classic token. Add a 'cloud-scoped'
+auth type: connect resolves the site's cloudId from /_edge/tenant_info, stores
+https://api.atlassian.com/ex/jira/<cloudId> as the site's apiBaseUrl, and routes
+every REST call (including attachment downloads reported on the site host)
+through it while siteUrl keeps serving browse links. The email is optional in
+this mode: with it the token is sent as Basic, without it as Bearer.
+
+The connect dialog gains an "API token / Scoped API token" toggle for Cloud and
+names the scopes to grant; the mode state, copy and toggles move into
+jira-connect-mode.ts and jira-connect-mode-toggles.tsx to keep the dialog
+under the component line budget.
+
+Bitbucket already accepts scoped API tokens on api.bitbucket.org in both auth
+modes, but a token missing the pull request write scope reads fine and then
+fails PR creation with a 403 that was reported as "not authenticated". Split
+the 403 into a scope hint, name the required scopes in the connect dialog and
+docs, and mention the read:user scope on a rejected verification.
+
+Closes #16486
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Hd8uKwtm5JWJuXtd3JknXt
+---
+ docs/site/content/docs/review/github.mdx      |   2 +-
+ docs/site/content/docs/review/jira.mdx        |   5 +-
+ src/main/bitbucket/credential-connection.ts   |   2 +-
+ .../bitbucket/pull-request-creation.test.ts   |  13 ++
+ src/main/bitbucket/pull-request-creation.ts   |  13 +-
+ src/main/ipc/jira.ts                          |   3 +-
+ src/main/jira/authenticated-request.ts        |  51 +++--
+ src/main/jira/client.test.ts                  | 138 ++++++++++++
+ src/main/jira/client.ts                       |  18 +-
+ src/main/jira/cloud-gateway.ts                |  30 +++
+ src/main/jira/site-credential-store.ts        |  12 +-
+ src/preload/api/jira-api.ts                   |   3 +-
+ src/preload/api/jira-bridge.ts                |  10 +-
+ .../src/components/jira-connect-dialog.tsx    | 197 ++++--------------
+ .../components/jira-connect-mode-toggles.tsx  |  97 +++++++++
+ .../src/components/jira-connect-mode.ts       | 135 ++++++++++++
+ .../settings/bitbucket-credentials-dialog.tsx |   8 +-
+ src/renderer/src/i18n/locales/en.json         |  15 +-
+ src/renderer/src/i18n/locales/fr.json         |   2 -
+ src/shared/jira-auth-type.ts                  |   6 +
+ src/shared/jira-types.ts                      |  10 +-
+ src/shared/rpc-contract/jira-params.ts        |   2 +-
+ 22 files changed, 574 insertions(+), 198 deletions(-)
+ create mode 100644 src/main/jira/cloud-gateway.ts
+ create mode 100644 src/renderer/src/components/jira-connect-mode-toggles.tsx
+ create mode 100644 src/renderer/src/components/jira-connect-mode.ts
+ create mode 100644 src/shared/jira-auth-type.ts
+
+diff --git a/docs/site/content/docs/review/github.mdx b/docs/site/content/docs/review/github.mdx
+index d7f1dca8..00f1c6ce 100644
+--- a/docs/site/content/docs/review/github.mdx
++++ b/docs/site/content/docs/review/github.mdx
+@@ -8,7 +8,7 @@ Hosted code review is a first-class part of the worktree. Orca links worktrees t
+ 
+ Connect the provider your repository uses from [Settings → Integrations](/docs/settings). GitHub has the deepest Actions and issue support; GitLab merge requests and issues use the same worktree review flow.
+ 
+-Bitbucket Cloud connects in-app from the same pane — **Connect** with **Email & API token** or an **Access token**. Orca verifies the credential before saving and can create pull requests from Source Control. Bitbucket Cloud has no draft PRs, so the composer hides the Draft toggle. `ORCA_BITBUCKET_*` environment variables still win over a saved credential. Azure DevOps and Gitea pull requests appear in the worktree sidebar and the Checks panel alongside GitHub, GitLab, and Bitbucket — the worktree creation flow checks them for remote conflicts before pushing.
++Bitbucket Cloud connects in-app from the same pane — **Connect** with **Email & API token** or an **Access token**. Atlassian API tokens with scopes work in either mode (Basic with the email, Bearer without); give them `read:user:bitbucket`, `read:repository:bitbucket`, `read:pullrequest:bitbucket`, and `write:pullrequest:bitbucket`, otherwise reads succeed while creating a pull request fails with a 403. Orca verifies the credential before saving and can create pull requests from Source Control. Bitbucket Cloud has no draft PRs, so the composer hides the Draft toggle. `ORCA_BITBUCKET_*` environment variables still win over a saved credential. Azure DevOps and Gitea pull requests appear in the worktree sidebar and the Checks panel alongside GitHub, GitLab, and Bitbucket — the worktree creation flow checks them for remote conflicts before pushing.
+ 
+ ## Reviews
+ 
+diff --git a/docs/site/content/docs/review/jira.mdx b/docs/site/content/docs/review/jira.mdx
+index aeca47e1..71b09c05 100644
+--- a/docs/site/content/docs/review/jira.mdx
++++ b/docs/site/content/docs/review/jira.mdx
+@@ -16,8 +16,9 @@ Jira sits next to GitHub and Linear in the task drawer. Browse Jira issues, upda
+ **Cloud**
+ 
+ - **Jira Cloud site URL** — e.g. `https://example.atlassian.net`.
+-- **Atlassian email** — the address on your Atlassian account.
+-- **Atlassian API token** — create one at [id.atlassian.com → Security → API tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
++- Token type:
++  - **API token** — a classic token paired with your **Atlassian email**. Create one at [id.atlassian.com → Security → API tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
++  - **Scoped API token** — a token created with scopes. Atlassian only accepts these on the `api.atlassian.com` gateway, so Orca resolves your site's cloud id once and routes every request through `https://api.atlassian.com/ex/jira/<cloudId>`; the site URL is still used for browse links. Grant `read:jira-work`, `write:jira-work`, and `read:jira-user`. The email is optional: with it the token is sent as Basic auth, without it as a Bearer token.
+ 
+ **Self-hosted**
+ 
+diff --git a/src/main/bitbucket/credential-connection.ts b/src/main/bitbucket/credential-connection.ts
+index c36980e8..e2380fef 100644
+--- a/src/main/bitbucket/credential-connection.ts
++++ b/src/main/bitbucket/credential-connection.ts
+@@ -59,7 +59,7 @@ export async function connectBitbucket(
+       // is down sends them to regenerate a credential that was fine.
+       error:
+         result.reason === 'rejected'
+-          ? 'Bitbucket rejected these credentials. Check the email and token, then try again.'
++          ? 'Bitbucket rejected these credentials. Check the email and token (a scoped API token also needs read:user:bitbucket), then try again.'
+           : 'Could not reach Bitbucket. Check your connection or the API base URL, then try again.'
+     }
+   }
+diff --git a/src/main/bitbucket/pull-request-creation.test.ts b/src/main/bitbucket/pull-request-creation.test.ts
+index 88fc73bc..b993cd68 100644
+--- a/src/main/bitbucket/pull-request-creation.test.ts
++++ b/src/main/bitbucket/pull-request-creation.test.ts
+@@ -165,6 +165,19 @@ describe('Bitbucket pull request creation', () => {
+     expect(!result.ok && result.error).toContain('Settings')
+   })
+ 
++  it('maps a 403 to the missing write scope instead of a reconnect prompt', async () => {
++    // Why: a scoped API token that reads pull requests but lacks the write scope
++    // is rejected with 403; telling the user to reconnect the same token loops.
++    globalThis.fetch = vi.fn(async () =>
++      Response.json({ error: { message: 'Forbidden' } }, { status: 403 })
++    ) as unknown as typeof fetch
++
++    const result = await createBitbucketPullRequest('/repo', CREATE_INPUT, 'local')
++
++    expect(result).toMatchObject({ ok: false, code: 'auth_required' })
++    expect(!result.ok && result.error).toContain('write:pullrequest:bitbucket')
++  })
++
+   it('refuses a non-Bitbucket remote', async () => {
+     gitExecFileAsyncMock.mockResolvedValue({
+       stdout: 'https://github.com/team/repo.git\n',
+diff --git a/src/main/bitbucket/pull-request-creation.ts b/src/main/bitbucket/pull-request-creation.ts
+index d0b02cc0..d02cabba 100644
+--- a/src/main/bitbucket/pull-request-creation.ts
++++ b/src/main/bitbucket/pull-request-creation.ts
+@@ -44,7 +44,7 @@ function classifyCreateError(error: unknown): CreateHostedReviewResult {
+   }
+   const lower = message.toLowerCase()
+   const status = error instanceof HostedReviewApiRequestError ? error.status : null
+-  if (status === 401 || status === 403 || lower.includes('unauthorized')) {
++  if (status === 401 || lower.includes('unauthorized')) {
+     return {
+       ok: false,
+       code: 'auth_required',
+@@ -52,6 +52,17 @@ function classifyCreateError(error: unknown): CreateHostedReviewResult {
+         'Create PR failed: Bitbucket is not authenticated. Next step: connect Bitbucket in Settings > Integrations, or set ORCA_BITBUCKET_* in this environment.'
+     }
+   }
++  // Why: a 403 is a credential that reads fine but may not write — the shape a
++  // scoped API token takes when it lacks the pull request write scope. Sending
++  // the user to reconnect the same token would loop them.
++  if (status === 403) {
++    return {
++      ok: false,
++      code: 'auth_required',
++      error:
++        'Create PR failed: Bitbucket denied this credential write access. A scoped API token needs write:pullrequest:bitbucket (with read:repository:bitbucket and read:pullrequest:bitbucket); other tokens need write permission on the repository.'
++    }
++  }
+   // Bitbucket answers a duplicate source branch with 400 plus this phrasing
+   // rather than a 409, so the text is the only reliable signal.
+   if (lower.includes('already exists') || lower.includes('already a pull request')) {
+diff --git a/src/main/ipc/jira.ts b/src/main/ipc/jira.ts
+index 0d78eec5..42137ef2 100644
+--- a/src/main/ipc/jira.ts
++++ b/src/main/ipc/jira.ts
+@@ -1,5 +1,6 @@
+ import { ipcMain } from 'electron'
+ import { connect, disconnect, getStatus, selectSite, testConnection } from '../jira/client'
++import { normalizeJiraAuthType } from '../../shared/jira-auth-type'
+ import { _resetPreflightCache } from './preflight'
+ import { JiraCancellableRequests } from './jira-cancellable-requests'
+ import {
+@@ -99,7 +100,7 @@ export function registerJiraHandlers(): void {
+       siteUrl: args.siteUrl,
+       email: args.email,
+       apiToken: args.apiToken,
+-      authType: args.authType === 'server' ? 'server' : 'cloud'
++      authType: normalizeJiraAuthType(args.authType)
+     })
+     if (result.ok) {
+       _resetPreflightCache()
+diff --git a/src/main/jira/authenticated-request.ts b/src/main/jira/authenticated-request.ts
+index feb54167..d91e5922 100644
+--- a/src/main/jira/authenticated-request.ts
++++ b/src/main/jira/authenticated-request.ts
+@@ -22,6 +22,12 @@ export function apiBasePath(site: JiraSite): string {
+   return site.authType === 'server' ? '/rest/api/2' : '/rest/api/3'
+ }
+ 
++// Scoped Cloud tokens are only honoured on the api.atlassian.com gateway, so
++// REST calls go there while the site URL stays the browse/identity origin.
++export function apiBaseUrl(site: JiraSite): string {
++  return site.apiBaseUrl ?? site.siteUrl
++}
++
+ export class JiraApiError extends Error {
+   status: number | null
+ 
+@@ -35,8 +41,9 @@ export function authHeader(email: string, apiToken: string, authType?: JiraAuthT
+   // Self-hosted with no username = a personal access token (Bearer); Basic auth
+   // with a PAT in the password slot is what produces the 401s users report.
+   // Self-hosted WITH a username is classic username+password Basic auth, which
+-  // older Server/DC instances (predating PATs) require. Cloud is always Basic.
+-  if (authType === 'server' && !email) {
++  // older Server/DC instances (predating PATs) require. Classic Cloud is always
++  // Basic; a scoped Cloud token is Basic with the email and Bearer without.
++  if ((authType === 'server' || authType === 'cloud-scoped') && !email) {
+     return `Bearer ${apiToken}`
+   }
+   return `Basic ${Buffer.from(`${email}:${apiToken}`).toString('base64')}`
+@@ -53,7 +60,7 @@ function describeErrorCause(error: unknown): string | undefined {
+   return cause === undefined ? undefined : String(cause)
+ }
+ 
+-async function jiraFetch(url: string, init: RequestInit): Promise<Response> {
++export async function jiraFetch(url: string, init: RequestInit): Promise<Response> {
+   return withSpan(
+     'jira.request',
+     async (span) => {
+@@ -95,7 +102,7 @@ async function jiraFetch(url: string, init: RequestInit): Promise<Response> {
+ }
+ 
+ export async function requestWithCredentials(
+-  siteUrl: string,
++  baseUrl: string,
+   email: string,
+   apiToken: string,
+   path: string,
+@@ -107,7 +114,7 @@ export async function requestWithCredentials(
+   headers.set('Content-Type', 'application/json')
+   headers.set('User-Agent', JIRA_API_USER_AGENT)
+   headers.set('Authorization', authHeader(email, apiToken, authType))
+-  const response = await jiraFetch(`${siteUrl}${path}`, {
++  const response = await jiraFetch(`${baseUrl}${path}`, {
+     ...init,
+     headers
+   })
+@@ -151,7 +158,7 @@ export async function jiraRequest<T>(
+   headers.set('Content-Type', 'application/json')
+   headers.set('User-Agent', JIRA_API_USER_AGENT)
+   headers.set('Authorization', client.authorization)
+-  const response = await jiraFetch(`${client.site.siteUrl}${path}`, {
++  const response = await jiraFetch(`${apiBaseUrl(client.site)}${path}`, {
+     ...init,
+     headers
+   })
+@@ -164,19 +171,33 @@ export async function jiraRequest<T>(
+   return (await response.json()) as T
+ }
+ 
++// Why: attachment metadata is provider-controlled; never forward Jira
++// credentials if a malformed response points at another origin. Cloud reports
++// content URLs on the site host even when the token is only valid on the
++// gateway, so those are re-rooted onto the gateway instead of rejected.
++function resolveBinaryRequestUrl(site: JiraSite, pathOrUrl: string): URL {
++  const siteUrl = new URL(site.siteUrl)
++  const requestUrl = /^https?:\/\//i.test(pathOrUrl)
++    ? new URL(pathOrUrl)
++    : new URL(`${site.siteUrl}${pathOrUrl}`)
++  if (site.apiBaseUrl) {
++    if (requestUrl.origin === new URL(site.apiBaseUrl).origin) {
++      return requestUrl
++    }
++    if (requestUrl.origin === siteUrl.origin) {
++      return new URL(`${site.apiBaseUrl}${requestUrl.pathname}${requestUrl.search}`)
++    }
++  } else if (requestUrl.origin === siteUrl.origin) {
++    return requestUrl
++  }
++  throw new JiraApiError('Jira attachment URL must use the configured site origin.', null)
++}
++
+ export async function jiraRequestBinary(
+   client: JiraClientForSite,
+   pathOrUrl: string
+ ): Promise<{ data: ArrayBuffer; contentType: string }> {
+-  const siteUrl = new URL(client.site.siteUrl)
+-  const requestUrl = /^https?:\/\//i.test(pathOrUrl)
+-    ? new URL(pathOrUrl)
+-    : new URL(`${client.site.siteUrl}${pathOrUrl}`)
+-  if (requestUrl.origin !== siteUrl.origin) {
+-    // Why: attachment metadata is provider-controlled; never forward Jira
+-    // credentials if a malformed response points at another origin.
+-    throw new JiraApiError('Jira attachment URL must use the configured site origin.', null)
+-  }
++  const requestUrl = resolveBinaryRequestUrl(client.site, pathOrUrl)
+   const headers = new Headers()
+   // Why: attachment content is binary; forcing JSON Accept/Content-Type can
+   // break downloads and confuses some Atlassian edge responses.
+diff --git a/src/main/jira/client.test.ts b/src/main/jira/client.test.ts
+index 7f57ad80..bee3d584 100644
+--- a/src/main/jira/client.test.ts
++++ b/src/main/jira/client.test.ts
+@@ -718,4 +718,142 @@ describe('Jira client credential storage', () => {
+     expect(headers.get('User-Agent')).toBe('Orca')
+     expect(fetchMock).not.toHaveBeenCalled()
+   })
++
++  it('connects a scoped Cloud token through the api.atlassian.com gateway', async () => {
++    // Why: Atlassian rejects scoped tokens on the site host, so the cloud id is
++    // resolved first and every REST call (including later reads) uses the gateway.
++    netFetchMock
++      .mockResolvedValueOnce(
++        new Response(JSON.stringify({ cloudId: 'cloud-abc' }), {
++          status: 200,
++          headers: { 'Content-Type': 'application/json' }
++        })
++      )
++      .mockResolvedValueOnce(
++        new Response(JSON.stringify({ accountId: 'account-alpha', displayName: 'Ada' }), {
++          status: 200,
++          headers: { 'Content-Type': 'application/json' }
++        })
++      )
++      .mockResolvedValueOnce(
++        new Response(JSON.stringify({ accountId: 'account-alpha', displayName: 'Ada' }), {
++          status: 200,
++          headers: { 'Content-Type': 'application/json' }
++        })
++      )
++    const jira = await loadClientModule()
++
++    await expect(
++      jira.connect({
++        siteUrl: 'example.atlassian.net',
++        email: 'ada@example.com',
++        apiToken: 'scoped-token',
++        authType: 'cloud-scoped'
++      })
++    ).resolves.toMatchObject({ ok: true, viewer: { displayName: 'Ada' } })
++
++    expect(netFetchMock.mock.calls[0]?.[0]).toBe('https://example.atlassian.net/_edge/tenant_info')
++    expect(netFetchMock.mock.calls[1]?.[0]).toBe(
++      'https://api.atlassian.com/ex/jira/cloud-abc/rest/api/3/myself'
++    )
++    const headers = netFetchMock.mock.calls[1]?.[1]?.headers as Headers
++    expect(headers.get('Authorization')).toBe(
++      `Basic ${Buffer.from('ada@example.com:scoped-token').toString('base64')}`
++    )
++
++    const siteFile = JSON.parse(
++      readFileSync(join(tempHome, '.orca', 'jira-sites.json'), { encoding: 'utf-8' })
++    ) as { sites: { siteUrl: string; authType: string; apiBaseUrl?: string }[] }
++    expect(siteFile.sites[0]).toMatchObject({
++      siteUrl: 'https://example.atlassian.net',
++      authType: 'cloud-scoped',
++      apiBaseUrl: 'https://api.atlassian.com/ex/jira/cloud-abc'
++    })
++    expect(jira.getStatus().viewer?.displayName).toBe('Ada')
++
++    await expect(jira.testConnection()).resolves.toMatchObject({ ok: true })
++    expect(netFetchMock.mock.calls[2]?.[0]).toBe(
++      'https://api.atlassian.com/ex/jira/cloud-abc/rest/api/3/myself'
++    )
++  })
++
++  it('sends a scoped Cloud token as Bearer when no email is given', async () => {
++    netFetchMock
++      .mockResolvedValueOnce(
++        new Response(JSON.stringify({ cloudId: 'cloud-abc' }), {
++          status: 200,
++          headers: { 'Content-Type': 'application/json' }
++        })
++      )
++      .mockResolvedValueOnce(
++        new Response(JSON.stringify({ accountId: 'account-alpha', displayName: 'Ada' }), {
++          status: 200,
++          headers: { 'Content-Type': 'application/json' }
++        })
++      )
++    const jira = await loadClientModule()
++
++    await expect(
++      jira.connect({
++        siteUrl: 'https://example.atlassian.net',
++        email: '',
++        apiToken: 'scoped-token',
++        authType: 'cloud-scoped'
++      })
++    ).resolves.toMatchObject({ ok: true, viewer: { accountId: 'account-alpha' } })
++    const headers = netFetchMock.mock.calls[1]?.[1]?.headers as Headers
++    expect(headers.get('Authorization')).toBe('Bearer scoped-token')
++  })
++
++  it('reports a scoped Cloud connection whose cloud id cannot be resolved', async () => {
++    netFetchMock.mockResolvedValueOnce(new Response('not found', { status: 404 }))
++    const jira = await loadClientModule()
++
++    await expect(
++      jira.connect({
++        siteUrl: 'jira.example.com',
++        email: '',
++        apiToken: 'scoped-token',
++        authType: 'cloud-scoped'
++      })
++    ).resolves.toMatchObject({ ok: false, error: expect.stringContaining('cloud id') })
++    expect(netFetchMock).toHaveBeenCalledTimes(1)
++  })
++
++  it('re-roots scoped-site attachment URLs from the site host onto the gateway', async () => {
++    const jira = await loadClientModule({ encryptionAvailable: true })
++    const client = {
++      site: {
++        id: 'site-scoped',
++        siteUrl: 'https://example.atlassian.net',
++        email: '',
++        displayName: 'Ada',
++        accountId: 'account-alpha',
++        authType: 'cloud-scoped' as const,
++        apiBaseUrl: 'https://api.atlassian.com/ex/jira/cloud-abc'
++      },
++      authorization: 'Bearer scoped-token'
++    }
++    netFetchMock.mockResolvedValueOnce(
++      new Response(Uint8Array.from([1, 2, 3]), {
++        status: 200,
++        headers: { 'Content-Type': 'image/png' }
++      })
++    )
++
++    await expect(
++      jira.jiraRequestBinary(
++        client,
++        'https://example.atlassian.net/rest/api/3/attachment/content/1?redirect=false'
++      )
++    ).resolves.toMatchObject({ contentType: 'image/png' })
++    expect(netFetchMock.mock.calls[0]?.[0]).toBe(
++      'https://api.atlassian.com/ex/jira/cloud-abc/rest/api/3/attachment/content/1?redirect=false'
++    )
++
++    await expect(
++      jira.jiraRequestBinary(client, 'https://files.example.com/attachment.png')
++    ).rejects.toThrow('configured site origin')
++    expect(netFetchMock).toHaveBeenCalledTimes(1)
++  })
+ })
+diff --git a/src/main/jira/client.ts b/src/main/jira/client.ts
+index 3e4dcaf6..4469a387 100644
+--- a/src/main/jira/client.ts
++++ b/src/main/jira/client.ts
+@@ -27,6 +27,8 @@ import {
+   type JiraClientForSite
+ } from './authenticated-request'
+ import { getSiteId, normalizeJiraSiteUrl, siteToViewer, toViewer } from './site-identity'
++import { resolveJiraGatewayBaseUrl } from './cloud-gateway'
++import { normalizeJiraAuthType } from '../../shared/jira-auth-type'
+ 
+ export function getClients(selection?: JiraSiteSelection | null): JiraClientForSite[] {
+   const file = getSiteFile()
+@@ -82,7 +84,7 @@ export async function connect(
+     return { ok: false, error: 'Enter a valid Jira site URL.' }
+   }
+ 
+-  const authType: JiraAuthType = args.authType === 'server' ? 'server' : 'cloud'
++  const authType: JiraAuthType = normalizeJiraAuthType(args.authType)
+   const email = args.email.trim()
+   const apiToken = args.apiToken.trim()
+   if (authType === 'server') {
+@@ -94,16 +96,25 @@ export async function connect(
+         error: email ? 'Password is required.' : 'Personal access token is required.'
+       }
+     }
++  } else if (authType === 'cloud-scoped') {
++    // The email is optional here: it only switches Bearer to Basic.
++    if (!apiToken) {
++      return { ok: false, error: 'Scoped API token is required.' }
++    }
+   } else if (!email || !apiToken) {
+     return { ok: false, error: 'Email and API token are required.' }
+   }
+ 
+   await acquire()
+   try {
++    // Why: scoped tokens are rejected on the site host with a bare 401, so the
++    // gateway URL is resolved up front and stored alongside the site.
++    const apiBaseUrl =
++      authType === 'cloud-scoped' ? await resolveJiraGatewayBaseUrl(siteUrl) : undefined
+     const myselfPath = authType === 'server' ? '/rest/api/2/myself' : '/rest/api/3/myself'
+     const viewer = toViewer(
+       (await requestWithCredentials(
+-        siteUrl,
++        apiBaseUrl ?? siteUrl,
+         email,
+         apiToken,
+         myselfPath,
+@@ -123,7 +134,8 @@ export async function connect(
+       email,
+       displayName: viewer.displayName,
+       accountId: viewer.accountId,
+-      authType
++      authType,
++      ...(apiBaseUrl ? { apiBaseUrl } : {})
+     }
+     saveToken(id, apiToken)
+     const file = getSiteFile()
+diff --git a/src/main/jira/cloud-gateway.ts b/src/main/jira/cloud-gateway.ts
+new file mode 100644
+index 00000000..608123f3
+--- /dev/null
++++ b/src/main/jira/cloud-gateway.ts
+@@ -0,0 +1,30 @@
++import { JiraApiError, jiraFetch } from './authenticated-request'
++
++export const ATLASSIAN_GATEWAY_ORIGIN = 'https://api.atlassian.com'
++
++export function jiraGatewayBaseUrl(cloudId: string): string {
++  return `${ATLASSIAN_GATEWAY_ORIGIN}/ex/jira/${encodeURIComponent(cloudId)}`
++}
++
++/**
++ * Scoped Atlassian API tokens only work on the api.atlassian.com gateway, which
++ * addresses a site by cloudId rather than hostname. The site publishes its
++ * cloudId unauthenticated, so no credential is needed to look it up.
++ */
++export async function resolveJiraGatewayBaseUrl(siteUrl: string): Promise<string> {
++  const tenantInfoUrl = new URL('/_edge/tenant_info', siteUrl).toString()
++  const response = await jiraFetch(tenantInfoUrl, {
++    headers: { Accept: 'application/json', 'User-Agent': 'Orca' }
++  })
++  if (!response.ok) {
++    throw new JiraApiError(
++      `Could not resolve the Atlassian cloud id for this site (HTTP ${response.status}). Scoped API tokens need an Atlassian Cloud site.`,
++      response.status
++    )
++  }
++  const cloudId = ((await response.json()) as { cloudId?: unknown }).cloudId
++  if (typeof cloudId !== 'string' || !cloudId.trim()) {
++    throw new JiraApiError('The site did not report an Atlassian cloud id.', null)
++  }
++  return jiraGatewayBaseUrl(cloudId.trim())
++}
+diff --git a/src/main/jira/site-credential-store.ts b/src/main/jira/site-credential-store.ts
+index 63c241ca..5eaa9fa5 100644
+--- a/src/main/jira/site-credential-store.ts
++++ b/src/main/jira/site-credential-store.ts
+@@ -8,6 +8,7 @@ import {
+   readStoredCredentialToken
+ } from '../integration-credential-file'
+ import type { JiraSite, JiraSiteSelection } from '../../shared/jira-types'
++import { normalizeJiraAuthType } from '../../shared/jira-auth-type'
+ 
+ export type JiraSiteFile = {
+   version: 1
+@@ -80,14 +81,21 @@ function normalizeSite(input: unknown): JiraSite | null {
+   ) {
+     return null
+   }
++  // Sites saved before self-hosted support have no authType; they are Cloud.
++  const authType = normalizeJiraAuthType(record.authType)
++  // A scoped site without its gateway URL cannot authenticate anywhere; drop it
++  // rather than send the scoped token to the site host and clear it on the 401.
++  if (authType === 'cloud-scoped' && typeof record.apiBaseUrl !== 'string') {
++    return null
++  }
+   return {
+     id: record.id,
+     siteUrl: record.siteUrl,
+     email: record.email,
+     displayName: record.displayName,
+     accountId: record.accountId,
+-    // Sites saved before self-hosted support have no authType; they are Cloud.
+-    authType: record.authType === 'server' ? 'server' : 'cloud'
++    authType,
++    ...(authType === 'cloud-scoped' ? { apiBaseUrl: record.apiBaseUrl as string } : {})
+   }
+ }
+ 
+diff --git a/src/preload/api/jira-api.ts b/src/preload/api/jira-api.ts
+index 06b1e2a8..d976fcd6 100644
+--- a/src/preload/api/jira-api.ts
++++ b/src/preload/api/jira-api.ts
+@@ -1,4 +1,5 @@
+ import type {
++  JiraAuthType,
+   JiraComment,
+   JiraConnectionStatus,
+   JiraCreateField,
+@@ -21,7 +22,7 @@ export type JiraApi = {
+     siteUrl: string
+     email: string
+     apiToken: string
+-    authType?: 'cloud' | 'server'
++    authType?: JiraAuthType
+   }) => Promise<{ ok: true; viewer: JiraViewer } | { ok: false; error: string }>
+   disconnect: (args?: { siteId?: string }) => Promise<void>
+   selectSite: (args: { siteId: JiraSiteSelection }) => Promise<JiraConnectionStatus>
+diff --git a/src/preload/api/jira-bridge.ts b/src/preload/api/jira-bridge.ts
+index 4b6b9910..2e8627bf 100644
+--- a/src/preload/api/jira-bridge.ts
++++ b/src/preload/api/jira-bridge.ts
+@@ -1,14 +1,10 @@
+ import { ipcRenderer } from 'electron'
+-import type { JiraProjectStatusOrder } from '../../shared/jira-types'
++import type { JiraAuthType, JiraProjectStatusOrder } from '../../shared/jira-types'
+ import type { PreloadApi } from '../api-types'
+ 
+ export const jiraApi = {
+-  connect: (args: {
+-    siteUrl: string
+-    email: string
+-    apiToken: string
+-    authType?: 'cloud' | 'server'
+-  }) => ipcRenderer.invoke('jira:connect', args),
++  connect: (args: { siteUrl: string; email: string; apiToken: string; authType?: JiraAuthType }) =>
++    ipcRenderer.invoke('jira:connect', args),
+ 
+   disconnect: (args?: { siteId?: string }): Promise<void> =>
+     ipcRenderer.invoke('jira:disconnect', args),
+diff --git a/src/renderer/src/components/jira-connect-dialog.tsx b/src/renderer/src/components/jira-connect-dialog.tsx
+index 0de90931..37cc6ceb 100644
+--- a/src/renderer/src/components/jira-connect-dialog.tsx
++++ b/src/renderer/src/components/jira-connect-dialog.tsx
+@@ -13,10 +13,16 @@ import {
+ } from '@/components/ui/dialog'
+ import { Input } from '@/components/ui/input'
+ import { Label } from '@/components/ui/label'
+-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+ import { cn } from '@/lib/utils'
+ import { hasRemoteProviderRuntime } from '@/lib/provider-runtime-context'
+ import { translate } from '@/i18n/i18n'
++import {
++  DEFAULT_JIRA_CONNECT_MODE,
++  describeJiraConnectMode,
++  jiraConnectCopy,
++  type JiraConnectMode
++} from './jira-connect-mode'
++import { JiraConnectModeToggles } from './jira-connect-mode-toggles'
+ 
+ type JiraConnectDialogProps = {
+   open: boolean
+@@ -27,10 +33,6 @@ type JiraConnectDialogProps = {
+ }
+ 
+ type ConnectState = 'idle' | 'connecting' | 'error'
+-type JiraInstanceType = 'cloud' | 'server'
+-// Self-hosted Jira accepts either a personal access token (Bearer) or classic
+-// username + password (Basic); older Server/DC instances predate PATs.
+-type ServerAuthMethod = 'pat' | 'basic'
+ 
+ // Why: mirrors the inline Jira connect dialog in TaskPage so the onboarding
+ // "Connect integrations" step can reuse the same site URL + email + API token
+@@ -50,8 +52,7 @@ export function JiraConnectDialog({
+   const tokenId = useId()
+   const errorId = useId()
+ 
+-  const [instanceType, setInstanceType] = useState<JiraInstanceType>('cloud')
+-  const [serverAuthMethod, setServerAuthMethod] = useState<ServerAuthMethod>('pat')
++  const [mode, setMode] = useState<JiraConnectMode>(DEFAULT_JIRA_CONNECT_MODE)
+   const [siteUrl, setSiteUrl] = useState('')
+   const [email, setEmail] = useState('')
+   const [apiToken, setApiToken] = useState('')
+@@ -65,8 +66,7 @@ export function JiraConnectDialog({
+     if (!open) {
+       return
+     }
+-    setInstanceType('cloud')
+-    setServerAuthMethod('pat')
++    setMode(DEFAULT_JIRA_CONNECT_MODE)
+     setSiteUrl('')
+     setEmail('')
+     setApiToken('')
+@@ -74,12 +74,9 @@ export function JiraConnectDialog({
+     setConnectError(null)
+   }, [open])
+ 
+-  const isServer = instanceType === 'server'
+-  // `needsIdentity` folds "Cloud Atlassian email" and "self-hosted Basic
+-  // username" — the identity slot that keys/labels the stored site. PAT auth
+-  // uses no identity, so the email field is hidden and left empty.
+-  const isServerBasic = isServer && serverAuthMethod === 'basic'
+-  const needsIdentity = !isServer || isServerBasic
++  const shape = describeJiraConnectMode(mode)
++  const { isServer, isScopedCloud, needsIdentity, showsIdentity } = shape
++  const copy = jiraConnectCopy(shape)
+   const canSubmit =
+     Boolean(siteUrl.trim()) &&
+     (!needsIdentity || Boolean(email.trim())) &&
+@@ -100,7 +97,8 @@ export function JiraConnectDialog({
+   // different secrets; drop the credential fields when the deployment or auth
+   // method changes so one can't be submitted as another (e.g. a password
+   // silently riding along as a Bearer PAT).
+-  const clearCredentialsOnModeSwitch = (): void => {
++  const handleModeChange = (nextMode: JiraConnectMode): void => {
++    setMode(nextMode)
+     setEmail('')
+     setApiToken('')
+     clearErrorOnEdit()
+@@ -131,9 +129,9 @@ export function JiraConnectDialog({
+         siteUrl: trimmedSite,
+         // Cloud sends the Atlassian email; self-hosted Basic sends the username;
+         // PAT sends nothing, so a stale email can't key/label the stored site.
+-        email: needsIdentity ? trimmedEmail : '',
++        email: showsIdentity ? trimmedEmail : '',
+         apiToken: trimmedToken,
+-        authType: instanceType
++        authType: shape.authType
+       })
+       if (!mountedRef.current) {
+         return
+@@ -142,8 +140,7 @@ export function JiraConnectDialog({
+         setSiteUrl('')
+         setEmail('')
+         setApiToken('')
+-        setInstanceType('cloud')
+-        setServerAuthMethod('pat')
++        setMode(DEFAULT_JIRA_CONNECT_MODE)
+         setConnectState('idle')
+         onOpenChange(false)
+         onConnected?.()
+@@ -169,22 +166,7 @@ export function JiraConnectDialog({
+           <DialogTitle className="leading-tight">
+             {translate('auto.components.jira.connect.dialog.8388bdea2b', 'Connect Jira site')}
+           </DialogTitle>
+-          <DialogDescription>
+-            {!isServer
+-              ? translate(
+-                  'auto.components.jira.connect.dialog.d785c42b8b',
+-                  'Use a Jira Cloud site URL, Atlassian email, and API token to browse issues.'
+-                )
+-              : isServerBasic
+-                ? translate(
+-                    'auto.components.jira.connect.dialog.1d947a07ab',
+-                    'Use a self-hosted Jira base URL, username, and password to browse issues.'
+-                  )
+-                : translate(
+-                    'auto.components.jira.connect.dialog.2e2b69e48e',
+-                    'Use a self-hosted Jira base URL and a personal access token to browse issues.'
+-                  )}
+-          </DialogDescription>
++          <DialogDescription>{copy.description}</DialogDescription>
+         </DialogHeader>
+         <form
+           className="flex flex-col gap-4"
+@@ -195,85 +177,19 @@ export function JiraConnectDialog({
+           }}
+         >
+           <div className="flex flex-col gap-3">
+-            <ToggleGroup
+-              type="single"
+-              variant="outline"
+-              value={instanceType}
++            <JiraConnectModeToggles
++              mode={mode}
+               disabled={connectState === 'connecting'}
+-              onValueChange={(value) => {
+-                if (!value || connectState === 'connecting') {
+-                  return
+-                }
+-                setInstanceType(value as JiraInstanceType)
+-                clearCredentialsOnModeSwitch()
+-              }}
+-              aria-label={translate(
+-                'auto.components.jira.connect.dialog.b67e919bd5',
+-                'Jira instance type'
+-              )}
+-            >
+-              <ToggleGroupItem value="cloud" className="h-8 px-3 text-xs">
+-                {translate('auto.components.jira.connect.dialog.17787d6e4b', 'Atlassian Cloud')}
+-              </ToggleGroupItem>
+-              <ToggleGroupItem value="server" className="h-8 px-3 text-xs">
+-                {translate('auto.components.jira.connect.dialog.bc7a831773', 'Self-hosted')}
+-              </ToggleGroupItem>
+-            </ToggleGroup>
+-            {isServer ? (
+-              <ToggleGroup
+-                type="single"
+-                variant="outline"
+-                value={serverAuthMethod}
+-                disabled={connectState === 'connecting'}
+-                onValueChange={(value) => {
+-                  if (!value || connectState === 'connecting') {
+-                    return
+-                  }
+-                  setServerAuthMethod(value as ServerAuthMethod)
+-                  clearCredentialsOnModeSwitch()
+-                }}
+-                aria-label={translate(
+-                  'auto.components.jira.connect.dialog.f49708c369',
+-                  'Jira authentication method'
+-                )}
+-              >
+-                <ToggleGroupItem value="pat" className="h-8 px-3 text-xs">
+-                  {translate(
+-                    'auto.components.jira.connect.dialog.730d973bae',
+-                    'Personal access token'
+-                  )}
+-                </ToggleGroupItem>
+-                <ToggleGroupItem value="basic" className="h-8 px-3 text-xs">
+-                  {translate(
+-                    'auto.components.jira.connect.dialog.84a810dd0e',
+-                    'Username & password'
+-                  )}
+-                </ToggleGroupItem>
+-              </ToggleGroup>
+-            ) : null}
++              onChange={handleModeChange}
++            />
+             <div className="space-y-2">
+               <Label htmlFor={siteUrlId} className="text-xs">
+-                {isServer
+-                  ? translate('auto.components.jira.connect.dialog.3489e186d6', 'Jira site URL')
+-                  : translate(
+-                      'auto.components.jira.connect.dialog.e176f9d0c5',
+-                      'Jira Cloud site URL'
+-                    )}
++                {copy.siteUrlLabel}
+               </Label>
+               <Input
+                 id={siteUrlId}
+                 autoFocus
+-                placeholder={
+-                  isServer
+-                    ? translate(
+-                        'auto.components.jira.connect.dialog.cbc27fa599',
+-                        'https://jira.example.com'
+-                      )
+-                    : translate(
+-                        'auto.components.jira.connect.dialog.70fcd360c4',
+-                        'https://example.atlassian.net'
+-                      )
+-                }
++                placeholder={copy.siteUrlPlaceholder}
+                 value={siteUrl}
+                 onChange={(event) => {
+                   setSiteUrl(event.target.value)
+@@ -282,27 +198,15 @@ export function JiraConnectDialog({
+                 disabled={connectState === 'connecting'}
+               />
+             </div>
+-            {needsIdentity ? (
++            {showsIdentity ? (
+               <div className="space-y-2">
+                 <Label htmlFor={emailId} className="text-xs">
+-                  {isServerBasic
+-                    ? translate('auto.components.jira.connect.dialog.8d1223fa5c', 'Username')
+-                    : translate(
+-                        'auto.components.jira.connect.dialog.2849ddb295',
+-                        'Atlassian email'
+-                      )}
++                  {copy.identityLabel}
+                 </Label>
+                 <Input
+                   id={emailId}
+-                  type={isServerBasic ? 'text' : 'email'}
+-                  placeholder={
+-                    isServerBasic
+-                      ? translate('auto.components.jira.connect.dialog.be9eba0a1b', 'username')
+-                      : translate(
+-                          'auto.components.jira.connect.dialog.e91b9a4073',
+-                          'you@example.com'
+-                        )
+-                  }
++                  type={copy.identityInputType}
++                  placeholder={copy.identityPlaceholder}
+                   value={email}
+                   onChange={(event) => {
+                     setEmail(event.target.value)
+@@ -314,34 +218,12 @@ export function JiraConnectDialog({
+             ) : null}
+             <div className="space-y-2">
+               <Label htmlFor={tokenId} className="text-xs">
+-                {isServerBasic
+-                  ? translate('auto.components.jira.connect.dialog.70035652d7', 'Password')
+-                  : isServer
+-                    ? translate(
+-                        'auto.components.jira.connect.dialog.730d973bae',
+-                        'Personal access token'
+-                      )
+-                    : translate('auto.components.jira.connect.dialog.3d81bf3ab3', 'API token')}
++                {copy.tokenLabel}
+               </Label>
+               <Input
+                 id={tokenId}
+                 type="password"
+-                placeholder={
+-                  isServerBasic
+-                    ? translate(
+-                        'auto.components.jira.connect.dialog.c50abbf340',
+-                        'Jira account password'
+-                      )
+-                    : isServer
+-                      ? translate(
+-                          'auto.components.jira.connect.dialog.8b9c7b9e7b',
+-                          'Jira personal access token'
+-                        )
+-                      : translate(
+-                          'auto.components.jira.connect.dialog.7b3967c12f',
+-                          'Atlassian API token'
+-                        )
+-                }
++                placeholder={copy.tokenPlaceholder}
+                 value={apiToken}
+                 onChange={(event) => {
+                   setApiToken(event.target.value)
+@@ -357,7 +239,7 @@ export function JiraConnectDialog({
+                 {connectError}
+               </p>
+             ) : null}
+-            {isServerBasic ? (
++            {shape.isServerBasic ? (
+               <p className="text-xs text-muted-foreground">
+                 {translate(
+                   'auto.components.jira.connect.dialog.d8737db691',
+@@ -373,7 +255,15 @@ export function JiraConnectDialog({
+               </p>
+             ) : (
+               <p className="text-xs text-muted-foreground">
+-                {translate('auto.components.jira.connect.dialog.8090504a3e', 'Create a token in')}{' '}
++                {isScopedCloud
++                  ? translate(
++                      'auto.components.jira.connect.dialog.cc1ca58cd8',
++                      'Create a token with scopes in'
++                    )
++                  : translate(
++                      'auto.components.jira.connect.dialog.8090504a3e',
++                      'Create a token in'
++                    )}{' '}
+                 <button
+                   type="button"
+                   className="text-primary underline-offset-2 hover:underline"
+@@ -388,7 +278,12 @@ export function JiraConnectDialog({
+                     'Atlassian account settings'
+                   )}
+                 </button>
+-                .
++                {isScopedCloud
++                  ? ` ${translate(
++                      'auto.components.jira.connect.dialog.fbf2400a02',
++                      'and grant read:jira-work, write:jira-work, and read:jira-user.'
++                    )}`
++                  : '.'}
+               </p>
+             )}
+             <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground/70">
+diff --git a/src/renderer/src/components/jira-connect-mode-toggles.tsx b/src/renderer/src/components/jira-connect-mode-toggles.tsx
+new file mode 100644
+index 00000000..34e4d5a1
+--- /dev/null
++++ b/src/renderer/src/components/jira-connect-mode-toggles.tsx
+@@ -0,0 +1,97 @@
++import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
++import { translate } from '@/i18n/i18n'
++import type {
++  CloudTokenKind,
++  JiraConnectMode,
++  JiraInstanceType,
++  ServerAuthMethod
++} from './jira-connect-mode'
++
++type JiraConnectModeTogglesProps = {
++  mode: JiraConnectMode
++  disabled: boolean
++  onChange: (mode: JiraConnectMode) => void
++}
++
++const ITEM_CLASS = 'h-8 px-3 text-xs'
++
++/** Deployment + credential-kind pickers; every change is a whole-mode update. */
++export function JiraConnectModeToggles({
++  mode,
++  disabled,
++  onChange
++}: JiraConnectModeTogglesProps): React.JSX.Element {
++  const guard = (apply: (value: string) => void) => (value: string) => {
++    if (!value || disabled) {
++      return
++    }
++    apply(value)
++  }
++  return (
++    <>
++      <ToggleGroup
++        type="single"
++        variant="outline"
++        value={mode.instanceType}
++        disabled={disabled}
++        onValueChange={guard((value) =>
++          onChange({ ...mode, instanceType: value as JiraInstanceType })
++        )}
++        aria-label={translate(
++          'auto.components.jira.connect.dialog.b67e919bd5',
++          'Jira instance type'
++        )}
++      >
++        <ToggleGroupItem value="cloud" className={ITEM_CLASS}>
++          {translate('auto.components.jira.connect.dialog.17787d6e4b', 'Atlassian Cloud')}
++        </ToggleGroupItem>
++        <ToggleGroupItem value="server" className={ITEM_CLASS}>
++          {translate('auto.components.jira.connect.dialog.bc7a831773', 'Self-hosted')}
++        </ToggleGroupItem>
++      </ToggleGroup>
++      {mode.instanceType === 'cloud' ? (
++        <ToggleGroup
++          type="single"
++          variant="outline"
++          value={mode.cloudTokenKind}
++          disabled={disabled}
++          onValueChange={guard((value) =>
++            onChange({ ...mode, cloudTokenKind: value as CloudTokenKind })
++          )}
++          aria-label={translate(
++            'auto.components.jira.connect.dialog.4823d0100d',
++            'Cloud token type'
++          )}
++        >
++          <ToggleGroupItem value="classic" className={ITEM_CLASS}>
++            {translate('auto.components.jira.connect.dialog.3d81bf3ab3', 'API token')}
++          </ToggleGroupItem>
++          <ToggleGroupItem value="scoped" className={ITEM_CLASS}>
++            {translate('auto.components.jira.connect.dialog.327c8aeb62', 'Scoped API token')}
++          </ToggleGroupItem>
++        </ToggleGroup>
++      ) : (
++        <ToggleGroup
++          type="single"
++          variant="outline"
++          value={mode.serverAuthMethod}
++          disabled={disabled}
++          onValueChange={guard((value) =>
++            onChange({ ...mode, serverAuthMethod: value as ServerAuthMethod })
++          )}
++          aria-label={translate(
++            'auto.components.jira.connect.dialog.f49708c369',
++            'Jira authentication method'
++          )}
++        >
++          <ToggleGroupItem value="pat" className={ITEM_CLASS}>
++            {translate('auto.components.jira.connect.dialog.730d973bae', 'Personal access token')}
++          </ToggleGroupItem>
++          <ToggleGroupItem value="basic" className={ITEM_CLASS}>
++            {translate('auto.components.jira.connect.dialog.84a810dd0e', 'Username & password')}
++          </ToggleGroupItem>
++        </ToggleGroup>
++      )}
++    </>
++  )
++}
+diff --git a/src/renderer/src/components/jira-connect-mode.ts b/src/renderer/src/components/jira-connect-mode.ts
+new file mode 100644
+index 00000000..a60a6df7
+--- /dev/null
++++ b/src/renderer/src/components/jira-connect-mode.ts
+@@ -0,0 +1,135 @@
++import type { JiraAuthType } from '../../../shared/jira-types'
++import { translate } from '@/i18n/i18n'
++
++export type JiraInstanceType = 'cloud' | 'server'
++// Self-hosted Jira accepts either a personal access token (Bearer) or classic
++// username + password (Basic); older Server/DC instances predate PATs.
++export type ServerAuthMethod = 'pat' | 'basic'
++// Atlassian Cloud tokens come in two shapes: classic (Basic auth on the site
++// host) and scoped (only honoured by the api.atlassian.com gateway).
++export type CloudTokenKind = 'classic' | 'scoped'
++
++export type JiraConnectMode = {
++  instanceType: JiraInstanceType
++  serverAuthMethod: ServerAuthMethod
++  cloudTokenKind: CloudTokenKind
++}
++
++export const DEFAULT_JIRA_CONNECT_MODE: JiraConnectMode = {
++  instanceType: 'cloud',
++  serverAuthMethod: 'pat',
++  cloudTokenKind: 'classic'
++}
++
++export type JiraConnectModeShape = {
++  isServer: boolean
++  isServerBasic: boolean
++  isScopedCloud: boolean
++  // The identity slot (Cloud email / Server username) keys and labels the stored
++  // site, so it is required whenever it is sent as part of Basic auth.
++  needsIdentity: boolean
++  // A scoped Cloud token shows the field but keeps it optional: Basic with an
++  // email, Bearer without.
++  showsIdentity: boolean
++  authType: JiraAuthType
++}
++
++export function describeJiraConnectMode(mode: JiraConnectMode): JiraConnectModeShape {
++  const isServer = mode.instanceType === 'server'
++  const isServerBasic = isServer && mode.serverAuthMethod === 'basic'
++  const isScopedCloud = !isServer && mode.cloudTokenKind === 'scoped'
++  const needsIdentity = (!isServer && !isScopedCloud) || isServerBasic
++  return {
++    isServer,
++    isServerBasic,
++    isScopedCloud,
++    needsIdentity,
++    showsIdentity: needsIdentity || isScopedCloud,
++    authType: isServer ? 'server' : isScopedCloud ? 'cloud-scoped' : 'cloud'
++  }
++}
++
++export type JiraConnectCopy = {
++  description: string
++  siteUrlLabel: string
++  siteUrlPlaceholder: string
++  identityLabel: string
++  identityPlaceholder: string
++  identityInputType: 'text' | 'email'
++  tokenLabel: string
++  tokenPlaceholder: string
++}
++
++function describeMode(shape: JiraConnectModeShape): string {
++  if (shape.isScopedCloud) {
++    return translate(
++      'auto.components.jira.connect.dialog.8e851d7ba0',
++      'Use a Jira Cloud site URL and a scoped API token; Orca calls the api.atlassian.com gateway on its behalf.'
++    )
++  }
++  if (!shape.isServer) {
++    return translate(
++      'auto.components.jira.connect.dialog.d785c42b8b',
++      'Use a Jira Cloud site URL, Atlassian email, and API token to browse issues.'
++    )
++  }
++  return shape.isServerBasic
++    ? translate(
++        'auto.components.jira.connect.dialog.1d947a07ab',
++        'Use a self-hosted Jira base URL, username, and password to browse issues.'
++      )
++    : translate(
++        'auto.components.jira.connect.dialog.2e2b69e48e',
++        'Use a self-hosted Jira base URL and a personal access token to browse issues.'
++      )
++}
++
++function tokenLabel(shape: JiraConnectModeShape): string {
++  if (shape.isServerBasic) {
++    return translate('auto.components.jira.connect.dialog.70035652d7', 'Password')
++  }
++  if (shape.isServer) {
++    return translate('auto.components.jira.connect.dialog.730d973bae', 'Personal access token')
++  }
++  return shape.isScopedCloud
++    ? translate('auto.components.jira.connect.dialog.327c8aeb62', 'Scoped API token')
++    : translate('auto.components.jira.connect.dialog.3d81bf3ab3', 'API token')
++}
++
++function tokenPlaceholder(shape: JiraConnectModeShape): string {
++  if (shape.isServerBasic) {
++    return translate('auto.components.jira.connect.dialog.c50abbf340', 'Jira account password')
++  }
++  if (shape.isServer) {
++    return translate('auto.components.jira.connect.dialog.8b9c7b9e7b', 'Jira personal access token')
++  }
++  return shape.isScopedCloud
++    ? translate('auto.components.jira.connect.dialog.8d9f6669a7', 'Atlassian API token with scopes')
++    : translate('auto.components.jira.connect.dialog.7b3967c12f', 'Atlassian API token')
++}
++
++export function jiraConnectCopy(shape: JiraConnectModeShape): JiraConnectCopy {
++  return {
++    description: describeMode(shape),
++    siteUrlLabel: shape.isServer
++      ? translate('auto.components.jira.connect.dialog.3489e186d6', 'Jira site URL')
++      : translate('auto.components.jira.connect.dialog.e176f9d0c5', 'Jira Cloud site URL'),
++    siteUrlPlaceholder: shape.isServer
++      ? translate('auto.components.jira.connect.dialog.cbc27fa599', 'https://jira.example.com')
++      : translate(
++          'auto.components.jira.connect.dialog.70fcd360c4',
++          'https://example.atlassian.net'
++        ),
++    identityLabel: shape.isServerBasic
++      ? translate('auto.components.jira.connect.dialog.8d1223fa5c', 'Username')
++      : shape.isScopedCloud
++        ? translate('auto.components.jira.connect.dialog.b4303bfe5a', 'Atlassian email (optional)')
++        : translate('auto.components.jira.connect.dialog.2849ddb295', 'Atlassian email'),
++    identityPlaceholder: shape.isServerBasic
++      ? translate('auto.components.jira.connect.dialog.be9eba0a1b', 'username')
++      : translate('auto.components.jira.connect.dialog.e91b9a4073', 'you@example.com'),
++    identityInputType: shape.isServerBasic ? 'text' : 'email',
++    tokenLabel: tokenLabel(shape),
++    tokenPlaceholder: tokenPlaceholder(shape)
++  }
++}
+diff --git a/src/renderer/src/components/settings/bitbucket-credentials-dialog.tsx b/src/renderer/src/components/settings/bitbucket-credentials-dialog.tsx
+index f95fd29b..ed240f6c 100644
+--- a/src/renderer/src/components/settings/bitbucket-credentials-dialog.tsx
++++ b/src/renderer/src/components/settings/bitbucket-credentials-dialog.tsx
+@@ -329,12 +329,12 @@ export function BitbucketCredentialsDialog({
+               <p>
+                 {isTokenMode
+                   ? translate(
+-                      'auto.components.settings.bitbucket.credentials.dialog.tokenHint',
+-                      'Repository, project, and workspace access tokens are created from the matching Bitbucket settings page and need read access to pull requests.'
++                      'auto.components.settings.bitbucket.credentials.dialog.tokenHintScopes',
++                      'Repository, project, and workspace access tokens are created from the matching Bitbucket settings page; an Atlassian API token with Bitbucket scopes works here too. Reading needs read:pullrequest:bitbucket, creating pull requests needs write:pullrequest:bitbucket.'
+                     )
+                   : translate(
+-                      'auto.components.settings.bitbucket.credentials.dialog.basicHint',
+-                      'Create an Atlassian API token for your account, then pair it with the email address that owns it.'
++                      'auto.components.settings.bitbucket.credentials.dialog.basicHintScopes',
++                      'Create an Atlassian API token for your account and pair it with the email address that owns it. A scoped token needs read:user:bitbucket, read:repository:bitbucket, read:pullrequest:bitbucket, and write:pullrequest:bitbucket to create pull requests.'
+                     )}
+               </p>
+               <button
+diff --git a/src/renderer/src/i18n/locales/en.json b/src/renderer/src/i18n/locales/en.json
+index fb1f37ea..e23de6c8 100644
+--- a/src/renderer/src/i18n/locales/en.json
++++ b/src/renderer/src/i18n/locales/en.json
+@@ -11783,13 +11783,13 @@
+               "apiTokenPlaceholder": "Atlassian API token",
+               "baseUrl": "API base URL (optional)",
+               "baseUrlPlaceholder": "https://api.bitbucket.org/2.0",
+-              "tokenHint": "Repository, project, and workspace access tokens are created from the matching Bitbucket settings page and need read access to pull requests.",
+-              "basicHint": "Create an Atlassian API token for your account, then pair it with the email address that owns it.",
+               "docsLink": "Bitbucket API token docs",
+               "storageNote": "Stored on this machine with encrypted storage when the OS keychain is available. ORCA_BITBUCKET_* environment variables always take precedence over what you save here.",
+               "cancel": "Cancel",
+               "verifying": "Verifying...",
+-              "connect": "Connect"
++              "connect": "Connect",
++              "tokenHintScopes": "Repository, project, and workspace access tokens are created from the matching Bitbucket settings page; an Atlassian API token with Bitbucket scopes works here too. Reading needs read:pullrequest:bitbucket, creating pull requests needs write:pullrequest:bitbucket.",
++              "basicHintScopes": "Create an Atlassian API token for your account and pair it with the email address that owns it. A scoped token needs read:user:bitbucket, read:repository:bitbucket, read:pullrequest:bitbucket, and write:pullrequest:bitbucket to create pull requests."
+             }
+           },
+           "integration": {
+@@ -16349,7 +16349,14 @@
+             "be9eba0a1b": "username",
+             "70035652d7": "Password",
+             "c50abbf340": "Jira account password",
+-            "d8737db691": "Use your Jira Server or Data Center account username and password."
++            "d8737db691": "Use your Jira Server or Data Center account username and password.",
++            "8e851d7ba0": "Use a Jira Cloud site URL and a scoped API token; Orca calls the api.atlassian.com gateway on its behalf.",
++            "4823d0100d": "Cloud token type",
++            "327c8aeb62": "Scoped API token",
++            "b4303bfe5a": "Atlassian email (optional)",
++            "8d9f6669a7": "Atlassian API token with scopes",
++            "cc1ca58cd8": "Create a token with scopes in",
++            "fbf2400a02": "and grant read:jira-work, write:jira-work, and read:jira-user."
+           }
+         }
+       },
+diff --git a/src/renderer/src/i18n/locales/fr.json b/src/renderer/src/i18n/locales/fr.json
+index db35a124..4061cbab 100644
+--- a/src/renderer/src/i18n/locales/fr.json
++++ b/src/renderer/src/i18n/locales/fr.json
+@@ -11292,8 +11292,6 @@
+               "apiTokenPlaceholder": "Token API Atlassian",
+               "baseUrl": "URL de base de l'API (facultatif)",
+               "baseUrlPlaceholder": "https://api.bitbucket.org/2.0",
+-              "tokenHint": "Les tokens d'accès de dépôt, projet et espace de travail se créent depuis la page de paramètres Bitbucket correspondante et nécessitent un accès en lecture aux pull requests.",
+-              "basicHint": "Créez un token API Atlassian pour votre compte, puis associez-le à l'adresse e-mail qui en est propriétaire.",
+               "docsLink": "Documentation des tokens API Bitbucket",
+               "storageNote": "Stocké sur cette machine avec chiffrement quand le trousseau de l'OS est disponible. Les variables d'environnement ORCA_BITBUCKET_* ont toujours priorité sur ce que vous enregistrez ici.",
+               "cancel": "Annuler",
+diff --git a/src/shared/jira-auth-type.ts b/src/shared/jira-auth-type.ts
+new file mode 100644
+index 00000000..61e57f10
+--- /dev/null
++++ b/src/shared/jira-auth-type.ts
+@@ -0,0 +1,6 @@
++import type { JiraAuthType } from './jira-types'
++
++/** Narrows an untrusted auth type (IPC, RPC, disk) to a known value; unknown means Cloud. */
++export function normalizeJiraAuthType(value: unknown): JiraAuthType {
++  return value === 'server' || value === 'cloud-scoped' ? value : 'cloud'
++}
+diff --git a/src/shared/jira-types.ts b/src/shared/jira-types.ts
+index 2b360044..67163fa4 100644
+--- a/src/shared/jira-types.ts
++++ b/src/shared/jira-types.ts
+@@ -1,7 +1,10 @@
+ // 'cloud' = Atlassian Cloud (email + API token, Basic auth, REST v3).
++// 'cloud-scoped' = Atlassian Cloud with a scoped API token. Atlassian only
++// honours those on the api.atlassian.com gateway, so REST calls go to
++// `apiBaseUrl` while `siteUrl` keeps serving browse links.
+ // 'server' = self-hosted Jira Server/Data Center (personal access token,
+ // Bearer auth, REST v2). Older stored sites omit the field and mean 'cloud'.
+-export type JiraAuthType = 'cloud' | 'server'
++export type JiraAuthType = 'cloud' | 'cloud-scoped' | 'server'
+ 
+ export type JiraSite = {
+   id: string
+@@ -10,6 +13,8 @@ export type JiraSite = {
+   displayName: string
+   accountId: string
+   authType?: JiraAuthType
++  // Set for 'cloud-scoped': https://api.atlassian.com/ex/jira/<cloudId>.
++  apiBaseUrl?: string
+ }
+ 
+ export type JiraViewer = {
+@@ -137,7 +142,8 @@ export type JiraIssueFilter = 'assigned' | 'reported' | 'all' | 'done'
+ export type JiraConnectArgs = {
+   siteUrl: string
+   // Ignored for 'server' auth: self-hosted PATs authenticate via Bearer
+-  // header alone, so the email field may be empty.
++  // header alone, so the email field may be empty. Optional for
++  // 'cloud-scoped': with an email the token is sent as Basic, without as Bearer.
+   email: string
+   apiToken: string
+   authType?: JiraAuthType
+diff --git a/src/shared/rpc-contract/jira-params.ts b/src/shared/rpc-contract/jira-params.ts
+index b550124f..648c5cf7 100644
+--- a/src/shared/rpc-contract/jira-params.ts
++++ b/src/shared/rpc-contract/jira-params.ts
+@@ -19,7 +19,7 @@ export const Connect = z.object({
+   // Self-hosted PAT auth needs no email; connect() enforces it for Cloud.
+   email: OptionalPlainString,
+   apiToken: requiredString('API token is required'),
+-  authType: z.enum(['cloud', 'server']).optional()
++  authType: z.enum(['cloud', 'cloud-scoped', 'server']).optional()
+ })
+ 
+ export const SelectSite = z.object({
+-- 
+2.43.0
+
