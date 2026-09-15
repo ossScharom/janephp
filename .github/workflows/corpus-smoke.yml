@@ -4,6 +4,10 @@
 name: Corpus smoke
 
 on:
+  # TEMPORARY: trial run on the fork only, never merge
+  push:
+    branches:
+      - tmp/corpus-smoke-trial
   schedule:
     # 03:17 UTC daily. `schedule` only runs on the default branch and is paused
     # by GitHub after 60 days without commits; `workflow_dispatch` covers both.
